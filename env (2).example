@@ -1,0 +1,9 @@
+# ============ КОНФИГУРАЦИЯ БОТА ============
+BOT_TOKEN=твой_токен_бота_сюда
+ADMIN_ID=5291613279
+DEEPSEEK_API_KEY=твой_ключ_deepseek_сюда
+PAYMENT_PHONE=89532425259
+PAYMENT_BANK=Т-Банк
+
+# Опционально
+DB_PATH=repair_bot.db
