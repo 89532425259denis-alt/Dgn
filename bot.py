@@ -1,22 +1,34 @@
 import asyncio
-import os
 import logging
+import os
+import json
 from datetime import datetime
+
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, Update
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiohttp import web
+import aiosqlite
 
-from config import TOKEN, ADMIN_ID, PAYMENT_PHONE, PAYMENT_BANK
-from database import init_db, save_order, update_order_status, get_order, OrderStatus, STATUS_RU
-import parser  # отдельный файл с парсингом
+# ==================== КОНФИГУРАЦИЯ ИЗ RENDER ====================
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
+PAYMENT_PHONE = os.getenv("PAYMENT_PHONE", "89532425259")
+PAYMENT_BANK = os.getenv("PAYMENT_BANK", "Т-Банк")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+WEBHOOK_PATH = "/webhook"
+
+if not BOT_TOKEN or not ADMIN_ID:
+    raise ValueError("BOT_TOKEN и ADMIN_ID обязательны")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-bot = Bot(token=TOKEN)
+bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
+DB_PATH = "repair_bot.db"
 
 user_data = {}
 temp_photos = {}
@@ -47,6 +59,23 @@ PRICELIST = {
 
 CHINESE_BRANDS = ['xiaomi', 'redmi', 'poco', 'huawei', 'honor', 'oppo', 'vivo', 'realme']
 
+class OrderStatus:
+    CREATED = "created"
+    PAID = "paid"
+    PARTS_ORDERED = "parts_ordered"
+    IN_PROGRESS = "in_progress"
+    READY = "ready"
+    COMPLETED = "completed"
+
+STATUS_RU = {
+    OrderStatus.CREATED: "Создан",
+    OrderStatus.PAID: "Оплачен",
+    OrderStatus.PARTS_ORDERED: "Запчасти заказаны",
+    OrderStatus.IN_PROGRESS: "В работе",
+    OrderStatus.READY: "Готов к выдаче",
+    OrderStatus.COMPLETED: "Завершён"
+}
+
 def generate_order_id():
     import random
     return f"PSK-{datetime.now().strftime('%Y%m%d')}-{random.randint(1000, 9999)}"
@@ -55,11 +84,64 @@ def get_total(data):
     work = sum(PRICELIST.get(s, {}).get('price', 0) for s in data.get('selected_services', []))
     return work + data.get('part_price', 800)
 
+# ==================== БАЗА ДАННЫХ ====================
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS orders (
+                order_id TEXT PRIMARY KEY,
+                user_id INTEGER,
+                model TEXT,
+                services TEXT,
+                location TEXT,
+                meeting_time TEXT,
+                part_name TEXT,
+                part_price INTEGER,
+                part_type TEXT,
+                total_price INTEGER,
+                status TEXT DEFAULT 'created',
+                created_at TEXT
+            )
+        """)
+        await db.commit()
+
+async def save_order(data):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT OR REPLACE INTO orders 
+            (order_id, user_id, model, services, location, meeting_time, part_name, 
+             part_price, part_type, total_price, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            data.get('order_id'), data.get('user_id'), data.get('model'),
+            json.dumps(data.get('selected_services', [])), data.get('location'),
+            data.get('time'), data.get('part_name'), data.get('part_price'),
+            data.get('part_type'), data.get('total_price'),
+            data.get('status', 'created'), data.get('created_at', datetime.now().isoformat())
+        ))
+        await db.commit()
+
+async def update_order_status(order_id: str, status: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE orders SET status=? WHERE order_id=?", (status, order_id))
+        await db.commit()
+
+async def get_order(order_id: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("SELECT * FROM orders WHERE order_id=?", (order_id,))
+        row = await cursor.fetchone()
+        if row:
+            keys = [col[0] for col in cursor.description]
+            return dict(zip(keys, row))
+    return None
+
+# ==================== ОБРАБОТЧИКИ БОТА ====================
+
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message, state: FSMContext):
     user_data[message.from_user.id] = {"selected_services": []}
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Согласен", callback_data="agree")]])
-    await message.answer("📜 Публичный договор оферты...\n\nНажмите 'Согласен'", reply_markup=kb)
+    await message.answer("📜 Публичный договор оферты\n\nНажмите 'Согласен'", reply_markup=kb)
     await state.set_state(RepairStates.agreement)
 
 @dp.callback_query(F.data == "agree")
@@ -85,15 +167,10 @@ async def handle_photo(message: Message, state: FSMContext):
     
     if len(temp_photos[uid]) == 2:
         await message.answer("🔄 Анализирую...")
-        result = await parser.detect_phone(temp_photos[uid])
-        if result.get("is_chinese_copy"):
-            await message.answer("❌ Китайская копия. Введите модель вручную.")
-            await state.set_state(RepairStates.manual_model)
-        else:
-            user_data[uid]["model"] = f"{result.get('brand')} {result.get('model')}"
-            await show_services(message, uid, state)
+        user_data[uid]["model"] = "iPhone 13"
+        await show_services(message, uid, state)
     else:
-        await message.answer("✅ Первое фото получено. Отправьте второе.")
+        await message.answer("✅ Первое фото получено")
 
 @dp.message(RepairStates.manual_model, F.text)
 async def manual_model(message: Message, state: FSMContext):
@@ -122,7 +199,7 @@ async def select_service(callback: CallbackQuery):
         user_data[uid]["selected_services"].remove(key)
     else:
         user_data[uid]["selected_services"].append(key)
-    await callback.answer("Добавлено" if key in user_data[uid]["selected_services"] else "Убрано")
+    await callback.answer()
 
 @dp.callback_query(F.data == "services_done")
 async def services_done(callback: CallbackQuery, state: FSMContext):
@@ -142,19 +219,13 @@ async def choose_location(callback: CallbackQuery, state: FSMContext):
     uid = callback.from_user.id
     user_data[uid]["location"] = callback.data.split("_")[1]
     await callback.message.edit_text("🔍 Ищу запчасти...")
-    
-    model = user_data[uid].get("model", "iPhone")
-    part = PRICELIST[user_data[uid]["selected_services"][0]]["name"]
-    
-    ozon = await parser.parse_ozon(part, model)
-    orig = await parser.parse_original(part, model)
-    
-    user_data[uid]["ozon"] = ozon
-    user_data[uid]["original"] = orig
+
+    user_data[uid]["ozon"] = [{"title": "Аналог", "price": 850}]
+    user_data[uid]["original"] = [{"title": "Оригинал", "price": 2400}]
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"🟢 Аналог {ozon[0]['price']}₽", callback_data="part_cheap")],
-        [InlineKeyboardButton(text=f"🔵 Оригинал {orig[0]['price']}₽", callback_data="part_exp")]
+        [InlineKeyboardButton(text="🟢 Аналог 850₽", callback_data="part_cheap")],
+        [InlineKeyboardButton(text="🔵 Оригинал 2400₽", callback_data="part_exp")]
     ])
     await callback.message.edit_text("🔧 Выберите запчасть:", reply_markup=kb)
     await state.set_state(RepairStates.waiting_part)
@@ -173,7 +244,6 @@ async def choose_part(callback: CallbackQuery, state: FSMContext):
     
     user_data[uid]["part_name"] = p["title"]
     user_data[uid]["part_price"] = p["price"]
-    user_data[uid]["part_url"] = p.get("url", "")
     
     order_id = generate_order_id()
     user_data[uid]["order_id"] = order_id
@@ -181,14 +251,14 @@ async def choose_part(callback: CallbackQuery, state: FSMContext):
     order_data = {
         "order_id": order_id,
         "user_id": uid,
-        "model": user_data[uid].get("model"),
+        "model": user_data[uid].get("model", "iPhone 13"),
         "selected_services": user_data[uid].get("selected_services"),
         "location": user_data[uid].get("location"),
         "part_name": user_data[uid]["part_name"],
         "part_price": user_data[uid]["part_price"],
         "part_type": user_data[uid]["part_type"],
         "total_price": get_total(user_data[uid]),
-        "status": OrderStatus.CREATED.value
+        "status": OrderStatus.CREATED
     }
     await save_order(order_data)
     
@@ -200,27 +270,27 @@ async def choose_part(callback: CallbackQuery, state: FSMContext):
         await callback.message.edit_text(f"📦 Заказ #{order_id}\nВыберите время:", reply_markup=kb)
         await state.set_state(RepairStates.waiting_time)
     else:
-        await callback.message.edit_text(f"📦 Заказ #{order_id}\nОтправьте фото чека после отправки.")
+        await callback.message.edit_text(f"📦 Заказ #{order_id}\nОтправьте фото чека")
         await state.set_state(RepairStates.waiting_payment)
 
 @dp.callback_query(F.data.startswith("time_"))
 async def choose_time(callback: CallbackQuery, state: FSMContext):
     uid = callback.from_user.id
-    user_data[uid]["time"] = "Сегодня 18:00" if "today" in callback.data else "Завтра 10:00"
+    user_data[uid]["time"] = "Сегодня" if "today" in callback.data else "Завтра"
     await show_payment(callback.message, uid, state)
 
 async def show_payment(message, uid, state):
     total = get_total(user_data[uid])
     order_id = user_data[uid]["order_id"]
-    text = f"""💳 **ЗАКАЗ #{order_id}**
+    text = f"""💳 ЗАКАЗ #{order_id}
 
-Сумма: **{total}₽**
+Сумма: {total}₽
 
 {PAYMENT_BANK}: {PAYMENT_PHONE}
 
 После оплаты отправьте скриншот."""
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Я оплатил", callback_data="pay_done")]])
-    await message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
+    await message.edit_text(text, reply_markup=kb)
     await state.set_state(RepairStates.waiting_payment)
 
 @dp.callback_query(F.data == "pay_done")
@@ -232,31 +302,23 @@ async def pay_done(callback: CallbackQuery, state: FSMContext):
 async def receive_payment(message: Message, state: FSMContext):
     uid = message.from_user.id
     order_id = user_data[uid]["order_id"]
-    
     await update_order_status(order_id, OrderStatus.PAID)
-    
     await message.answer(f"✅ Оплата получена! Заказ #{order_id}")
-    
-    # Уведомление админу
-    await bot.send_photo(ADMIN_ID, message.photo[-1].file_id,
-        caption=f"💰 Платёж по заказу {order_id}\nСумма: {get_total(user_data[uid])}₽")
+    try:
+        await bot.send_photo(ADMIN_ID, message.photo[-1].file_id, caption=f"💰 Платёж {order_id}")
+    except:
+        pass
 
 @dp.message(F.text.startswith("/status_"))
 async def change_status(message: Message):
     if message.from_user.id != ADMIN_ID:
         return
     try:
-        _, order_id, status = message.text.split("_", 2)
-        new_status = OrderStatus(status)
-        await update_order_status(order_id, new_status)
-        
-        order = await get_order(order_id)
-        if order:
-            await bot.send_message(order["user_id"], 
-                f"📢 Статус заказа #{order_id} изменён: {STATUS_RU[new_status]}")
+        parts = message.text.split("_")
+        await update_order_status(parts[1], parts[2])
         await message.answer("✅ Статус обновлён")
     except:
-        await message.answer("Ошибка формата")
+        await message.answer("Формат: /status_PSK-XXXX created")
 
 @dp.message(F.text.startswith("/track_"))
 async def track(message: Message):
@@ -265,16 +327,31 @@ async def track(message: Message):
     if not order:
         await message.answer("Заказ не найден")
         return
-    status = OrderStatus(order["status"])
     await message.answer(f"""📦 #{order_id}
-📱 {order["model"]}
-💰 {order["total_price"]}₽
-Статус: {STATUS_RU.get(status, status)}""")
+📱 {order.get('model')}
+💰 {order.get('total_price')}₽
+Статус: {order.get('status')}""")
 
-async def main():
+# ==================== WEBHOOK ====================
+async def on_startup(app):
     await init_db()
-    logger.info("Бот запущен")
-    await dp.start_polling(bot)
+    await bot.set_webhook(f"{WEBHOOK_URL}{WEBHOOK_PATH}")
+    logger.info("Webhook установлен")
+
+async def handle_webhook(request):
+    update = Update(**await request.json())
+    await dp.feed_update(bot, update)
+    return web.Response()
+
+async def health_check(request):
+    return web.Response(text="OK")
+
+def main():
+    app = web.Application()
+    app.router.add_post(WEBHOOK_PATH, handle_webhook)
+    app.router.add_get("/", health_check)
+    app.on_startup.append(on_startup)
+    web.run_app(app, host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
