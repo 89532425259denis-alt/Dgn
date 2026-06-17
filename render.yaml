@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: repair-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot_render.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: PAYMENT_PHONE
+        value: "89532425259"
+      - key: PAYMENT_BANK
+        value: "Т-Банк"
+      - key: WEBHOOK_URL
+        sync: false
